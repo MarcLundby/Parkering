@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 Avantpark Auto Check-in — GitHub Actions version
-=================================================
-Kører via GitHub Actions cron — ingen server nødvendig.
 Nummerplader hentes fra GitHub Secret: NUMMERPLADER
 Format: "AB12345:+4512345678,CD67890:+4587654321"
 """
@@ -13,16 +11,12 @@ import json
 import time
 import logging
 from pathlib import Path
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
-URL            = "https://vqr.avantpark.dk/QRCode/EnterPlate?Hash=jZqtyJgHJ"
-VERIFIED_FILE  = Path("verified_plates.json")
+URL           = "https://vqr.avantpark.dk/QRCode/EnterPlate?Hash=jZqtyJgHJ"
+VERIFIED_FILE = Path("verified_plates.json")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
 
@@ -42,7 +36,6 @@ def hent_plader() -> list[dict]:
     if not raw:
         log.error("❌ NUMMERPLADER secret mangler.")
         sys.exit(1)
-
     plader = []
     for del_ in raw.split(","):
         del_ = del_.strip()
@@ -50,12 +43,10 @@ def hent_plader() -> list[dict]:
             plade, tlf = del_.split(":", 1)
             plader.append({"plade": plade.strip().upper(), "tlf": tlf.strip()})
         else:
-            log.warning(f"  ⚠️  Ignorerer '{del_}' — mangler telefonnummer (format: PLADE:+4512345678)")
-
+            log.warning(f"  ⚠️  Ignorerer '{del_}' — mangler telefonnummer")
     if not plader:
         log.error("❌ Ingen gyldige nummerplader fundet.")
         sys.exit(1)
-
     return plader
 
 
@@ -65,18 +56,10 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
         )
         context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             locale="da-DK",
         )
         page = context.new_page()
@@ -84,14 +67,7 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=30_000)
 
-            plate_input = page.locator(
-                "input[type='text'], input[name*='plate' i], "
-                "input[name*='nummerplade' i], input[id*='plate' i]"
-            ).first
-            plate_input.wait_for(state="visible", timeout=15_000)
-            plate_input.click()
-            plate_input.fill(plade)
-
+            # ── Trin 1: Vælg kvitteringstype FØRST ──────────────
             if første_gang:
                 try:
                     page.get_by_text("SMS-kvittering", exact=True).click(timeout=5_000)
@@ -99,9 +75,8 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
                     page.locator("input[type='radio']:nth-of-type(3)").click(timeout=5_000)
 
                 tlf_input = page.locator(
-                    "input[type='tel'], input[name*='phone' i], "
-                    "input[name*='mobile' i], input[name*='telefon' i], "
-                    "input[placeholder*='telefon' i], input[placeholder*='mobil' i]"
+                    "input[type='tel'], input[name*='phone' i], input[name*='mobile' i], "
+                    "input[name*='telefon' i], input[placeholder*='telefon' i], input[placeholder*='mobil' i]"
                 ).first
                 tlf_input.wait_for(state="visible", timeout=8_000)
                 tlf_input.fill(tlf)
@@ -112,32 +87,45 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
                 except Exception:
                     page.get_by_text("Ingen kvittering ønsket", exact=True).click(timeout=5_000)
 
+            # ── Trin 2: Vent på Cloudflare ──────────────────────
             log.info("  Venter på Cloudflare…")
             time.sleep(10)
 
+            # ── Trin 3: Udfyld nummerplade SIDST ────────────────
+            # (gøres efter alt andet så intet kan nulstille feltet)
+            plate_input = page.locator(
+                "input[type='text'], input[name*='plate' i], "
+                "input[name*='nummerplade' i], input[id*='plate' i]"
+            ).first
+            plate_input.wait_for(state="visible", timeout=10_000)
+            plate_input.click()
+            plate_input.fill("")
+            plate_input.type(plade)  # type() simulerer rigtige tastetryk
+            log.info(f"  Nummerplade udfyldt: {plade}")
+
+            # ── Trin 4: Indsend ──────────────────────────────────
             submit = page.locator("button[type='submit'], input[type='submit']").first
             submit.wait_for(state="visible", timeout=10_000)
             submit.click()
             log.info("  Klikket indsend — venter på svar…")
 
-            # Vent lidt på at siden skifter
             time.sleep(5)
 
-            # Print sidens fulde tekst så vi kan se hvad der sker
             current_url = page.url
-            body_text = page.inner_text("body")
-            log.info(f"  URL efter indsend: {current_url}")
-            log.info(f"  Side-tekst: {body_text[:500]}")
+            body_text   = page.inner_text("body")
+            log.info(f"  URL: {current_url}")
+            log.info(f"  Side-tekst: {body_text[:300]}")
 
-            if any(w in body_text.lower() for w in ["bekræft", "registrer", "confirm", "success", "tak", "gennemført", "registered", "completed"]):
+            if "confirm" in current_url.lower() or any(
+                w in body_text.lower() for w in ["bekræft", "registrer", "confirm", "success", "tak", "gennemført", "registered"]
+            ):
                 log.info(f"  ✅ {plade} — GENNEMFØRT")
                 return True
 
-            if "confirm" in current_url.lower() or "success" in current_url.lower() or "tak" in current_url.lower():
-                log.info(f"  ✅ {plade} — GENNEMFØRT (URL bekræftet)")
-                return True
-
-            log.warning(f"  ⚠️  {plade} — Usikker på resultatet, se tekst ovenfor")
+            if "påkrævet" in body_text.lower() or "required" in body_text.lower():
+                log.error(f"  ❌ {plade} — Formularfejl: et felt mangler stadig")
+            else:
+                log.warning(f"  ⚠️  {plade} — Usikker på resultatet")
             return False
 
         except Exception as e:
@@ -158,8 +146,8 @@ def main():
     fejl         = 0
 
     for i, item in enumerate(plader):
-        plade      = item["plade"]
-        tlf        = item["tlf"]
+        plade       = item["plade"]
+        tlf         = item["tlf"]
         første_gang = plade not in verificerede
 
         ok = check_in(plade, tlf, første_gang)
