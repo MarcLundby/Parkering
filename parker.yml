@@ -2,11 +2,11 @@ name: Avantpark Auto Check-in
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # Hver 2. time (UTC)
-  workflow_dispatch:          # Manuel kørsel fra Actions-fanen
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
 
 permissions:
-  contents: write             # Nødvendig for at gemme verified_plates.json
+  contents: write
 
 jobs:
   check-in:
@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Hent kode (inkl. verified_plates.json)
+      - name: Hent kode
         uses: actions/checkout@v4
 
       - name: Installer Python
@@ -33,7 +33,15 @@ jobs:
           NUMMERPLADER: ${{ secrets.NUMMERPLADER }}
         run: python parker_auto.py
 
-      - name: Gem verified_plates.json (kun hvis den ændrede sig)
+      - name: Upload screenshot hvis fejl
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fejl-screenshot
+          path: "*.png"
+          if-no-files-found: ignore
+
+      - name: Gem verified_plates.json
         run: |
           git config user.name  "Parkering Bot"
           git config user.email "bot@parkering"
