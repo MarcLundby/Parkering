@@ -1,0 +1,43 @@
+name: Avantpark Auto Check-in
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # Hver 2. time (UTC)
+  workflow_dispatch:          # Manuel kørsel fra Actions-fanen
+
+permissions:
+  contents: write             # Nødvendig for at gemme verified_plates.json
+
+jobs:
+  check-in:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Hent kode (inkl. verified_plates.json)
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer afhængigheder
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Kør check-in
+        env:
+          NUMMERPLADER: ${{ secrets.NUMMERPLADER }}
+        run: python parker_auto.py
+
+      - name: Gem verified_plates.json (kun hvis den ændrede sig)
+        run: |
+          git config user.name  "Parkering Bot"
+          git config user.email "bot@parkering"
+          git add verified_plates.json
+          git diff --cached --quiet || git commit -m "✅ Opdater verificerede nummerplader"
+          git push
+
