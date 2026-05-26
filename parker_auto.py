@@ -74,7 +74,7 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -200,3 +200,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
