@@ -50,13 +50,36 @@ def hent_plader() -> list[dict]:
     return plader
 
 
+def vent_på_turnstile(page, timeout=30) -> bool:
+    """Venter aktivt på at Cloudflare Turnstile gennemfører."""
+    log.info("  Venter på Cloudflare Turnstile…")
+    for i in range(timeout):
+        try:
+            token = page.evaluate("""() => {
+                const el = document.querySelector('[name="cf-turnstile-response"]');
+                return el ? el.value : '';
+            }""")
+            if token and len(token) > 10:
+                log.info(f"  ✓ Turnstile gennemført ({i+1} sek.)")
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    log.warning(f"  ⚠️  Turnstile ikke bekræftet efter {timeout} sek. — forsøger alligevel")
+    return False
+
+
 def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
     log.info(f"  ▷ {plade}  {'🆕 første gang → SMS til ' + tlf if første_gang else '✔ known → ingen kvittering'}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -67,7 +90,7 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=30_000)
 
-            # ── Trin 1: Vælg kvitteringstype FØRST ──────────────
+            # ── Trin 1: Vælg kvitteringstype ────────────────────
             if første_gang:
                 try:
                     page.get_by_text("SMS-kvittering", exact=True).click(timeout=5_000)
@@ -87,12 +110,7 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
                 except Exception:
                     page.get_by_text("Ingen kvittering ønsket", exact=True).click(timeout=5_000)
 
-            # ── Trin 2: Vent på Cloudflare ──────────────────────
-            log.info("  Venter på Cloudflare…")
-            time.sleep(10)
-
-            # ── Trin 3: Udfyld nummerplade SIDST ────────────────
-            # (gøres efter alt andet så intet kan nulstille feltet)
+            # ── Trin 2: Udfyld nummerplade ──────────────────────
             plate_input = page.locator(
                 "input[type='text'], input[name*='plate' i], "
                 "input[name*='nummerplade' i], input[id*='plate' i]"
@@ -100,8 +118,11 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
             plate_input.wait_for(state="visible", timeout=10_000)
             plate_input.click()
             plate_input.fill("")
-            plate_input.type(plade)  # type() simulerer rigtige tastetryk
+            plate_input.type(plade)
             log.info(f"  Nummerplade udfyldt: {plade}")
+
+            # ── Trin 3: Vent aktivt på Turnstile ────────────────
+            vent_på_turnstile(page, timeout=30)
 
             # ── Trin 4: Indsend ──────────────────────────────────
             submit = page.locator("button[type='submit'], input[type='submit']").first
@@ -109,23 +130,27 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
             submit.click()
             log.info("  Klikket indsend — venter på svar…")
 
-            time.sleep(5)
+            # Vent på siden skifter
+            try:
+                page.wait_for_url(
+                    lambda url: url != URL and "EnterPlate" not in url,
+                    timeout=15_000
+                )
+            except Exception:
+                time.sleep(5)
 
             current_url = page.url
             body_text   = page.inner_text("body")
             log.info(f"  URL: {current_url}")
             log.info(f"  Side-tekst: {body_text[:300]}")
 
-            if "confirm" in current_url.lower() or any(
+            if current_url != URL or "confirm" in current_url.lower() or any(
                 w in body_text.lower() for w in ["bekræft", "registrer", "confirm", "success", "tak", "gennemført", "registered"]
             ):
                 log.info(f"  ✅ {plade} — GENNEMFØRT")
                 return True
 
-            if "påkrævet" in body_text.lower() or "required" in body_text.lower():
-                log.error(f"  ❌ {plade} — Formularfejl: et felt mangler stadig")
-            else:
-                log.warning(f"  ⚠️  {plade} — Usikker på resultatet")
+            log.warning(f"  ⚠️  {plade} — Ingen bekræftelse modtaget")
             return False
 
         except Exception as e:
@@ -175,4 +200,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
