@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-Avantpark Auto Check-in — med første-gangs SMS-bekræftelse
-===========================================================
-Nye nummerplader: SMS-kvittering første gang (verifikation)
-Kendte nummerplader: Ingen kvittering herefter
-
-Secrets i GitHub:
-  NUMMERPLADER  →  AB12345:+4512345678,CD67890:+4587654321
-                   (plade:telefonnummer adskilt med komma)
-
-Filen verified_plates.json gemmes i dit repo og opdateres automatisk.
+Avantpark Auto Check-in — GitHub Actions version
+=================================================
+Kører via GitHub Actions cron — ingen server nødvendig.
+Nummerplader hentes fra GitHub Secret: NUMMERPLADER
+Format: "AB12345:+4512345678,CD67890:+4587654321"
 """
 
 import os
@@ -31,8 +26,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Indlæs og gem verificerede plader ─────────────────────────
-
 def indlæs_verificerede() -> set[str]:
     if VERIFIED_FILE.exists():
         return set(json.loads(VERIFIED_FILE.read_text()))
@@ -44,17 +37,10 @@ def gem_verificerede(plader: set[str]):
     log.info(f"  💾 verified_plates.json opdateret: {sorted(plader)}")
 
 
-# ── Parse nummerplader fra secret ─────────────────────────────
-
 def hent_plader() -> list[dict]:
-    """
-    Parser 'AB12345:+4512345678,CD67890:+4587654321'
-    til [{"plade": "AB12345", "tlf": "+4512345678"}, ...]
-    """
     raw = os.environ.get("NUMMERPLADER", "").strip()
     if not raw:
         log.error("❌ NUMMERPLADER secret mangler.")
-        log.error("   Format: AB12345:+4512345678,CD67890:+4587654321")
         sys.exit(1)
 
     plader = []
@@ -73,10 +59,7 @@ def hent_plader() -> list[dict]:
     return plader
 
 
-# ── Selve check-in logikken ────────────────────────────────────
-
 def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
-    kvittering = "SMS" if første_gang else "ingen"
     log.info(f"  ▷ {plade}  {'🆕 første gang → SMS til ' + tlf if første_gang else '✔ known → ingen kvittering'}")
 
     with sync_playwright() as p:
@@ -101,7 +84,6 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=30_000)
 
-            # Udfyld nummerplade
             plate_input = page.locator(
                 "input[type='text'], input[name*='plate' i], "
                 "input[name*='nummerplade' i], input[id*='plate' i]"
@@ -111,15 +93,11 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
             plate_input.fill(plade)
 
             if første_gang:
-                # Vælg SMS-kvittering
                 try:
-                    sms_radio = page.get_by_text("SMS-kvittering", exact=True)
-                    sms_radio.click(timeout=5_000)
+                    page.get_by_text("SMS-kvittering", exact=True).click(timeout=5_000)
                 except Exception:
-                    # Prøv radio-knap direkte
-                    page.locator("input[type='radio'][value*='sms' i], input[type='radio']:nth-of-type(3)").click(timeout=5_000)
+                    page.locator("input[type='radio']:nth-of-type(3)").click(timeout=5_000)
 
-                # Udfyld telefonnummer (feltet dukker op efter klik)
                 tlf_input = page.locator(
                     "input[type='tel'], input[name*='phone' i], "
                     "input[name*='mobile' i], input[name*='telefon' i], "
@@ -128,49 +106,46 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
                 tlf_input.wait_for(state="visible", timeout=8_000)
                 tlf_input.fill(tlf)
                 log.info(f"  SMS-nr udfyldt: {tlf}")
-
             else:
-                # Ingen kvittering
                 try:
                     page.locator("input[type='radio'][value='0'], input[type='radio']:first-of-type").first.click(timeout=5_000)
                 except Exception:
                     page.get_by_text("Ingen kvittering ønsket", exact=True).click(timeout=5_000)
 
-            # Vent på Cloudflare Turnstile
             log.info("  Venter på Cloudflare…")
-            time.sleep(8)
+            time.sleep(10)
 
-            # Indsend
             submit = page.locator("button[type='submit'], input[type='submit']").first
             submit.wait_for(state="visible", timeout=10_000)
             submit.click()
+            log.info("  Klikket indsend — venter på svar…")
 
-            # Bekræft success
-            try:
-                page.wait_for_url("**/Confirm**", timeout=15_000)
+            # Vent lidt på at siden skifter
+            time.sleep(5)
+
+            # Print sidens fulde tekst så vi kan se hvad der sker
+            current_url = page.url
+            body_text = page.inner_text("body")
+            log.info(f"  URL efter indsend: {current_url}")
+            log.info(f"  Side-tekst: {body_text[:500]}")
+
+            if any(w in body_text.lower() for w in ["bekræft", "registrer", "confirm", "success", "tak", "gennemført", "registered", "completed"]):
                 log.info(f"  ✅ {plade} — GENNEMFØRT")
                 return True
-            except PlaywrightTimeoutError:
-                body = page.inner_text("body")
-                if any(w in body.lower() for w in ["bekræft", "registrer", "confirm", "success", "tak"]):
-                    log.info(f"  ✅ {plade} — GENNEMFØRT")
-                    return True
-                log.warning(f"  ⚠️  {plade} — Usikker på resultatet")
-                page.screenshot(path=f"fejl_{plade}.png")
-                return False
+
+            if "confirm" in current_url.lower() or "success" in current_url.lower() or "tak" in current_url.lower():
+                log.info(f"  ✅ {plade} — GENNEMFØRT (URL bekræftet)")
+                return True
+
+            log.warning(f"  ⚠️  {plade} — Usikker på resultatet, se tekst ovenfor")
+            return False
 
         except Exception as e:
             log.error(f"  ❌ {plade} — Fejl: {e}")
-            try:
-                page.screenshot(path=f"fejl_{plade}.png")
-            except Exception:
-                pass
             return False
         finally:
             browser.close()
 
-
-# ── Main ───────────────────────────────────────────────────────
 
 def main():
     log.info("═" * 50)
@@ -198,7 +173,6 @@ def main():
         if i < len(plader) - 1:
             time.sleep(30)
 
-    # Gem opdateret liste (workflow committer filen bagefter)
     if nye_plader:
         gem_verificerede(verificerede)
         log.info(f"  🆕 Nye plader verificeret: {', '.join(nye_plader)}")
@@ -213,3 +187,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
