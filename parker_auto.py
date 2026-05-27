@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Avantpark Auto Check-in — GitHub Actions version
-Nummerplader hentes fra GitHub Secret: NUMMERPLADER
+Avantpark Auto Check-in — direkte HTTP POST
+Omgår Cloudflare Turnstile ved at sende formularen direkte.
 Format: "AB12345:+4512345678,CD67890:+4587654321"
 """
 
@@ -10,19 +10,23 @@ import sys
 import json
 import time
 import logging
+import requests
 from pathlib import Path
-from playwright.sync_api import sync_playwright
-try:
-    from playwright_stealth import stealth_sync
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
+from bs4 import BeautifulSoup
 
 URL           = "https://vqr.avantpark.dk/QRCode/EnterPlate?Hash=jZqtyJgHJ"
 VERIFIED_FILE = Path("verified_plates.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "da-DK,da;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": URL,
+}
 
 
 def indlæs_verificerede() -> set[str]:
@@ -58,110 +62,107 @@ def hent_plader() -> list[dict]:
 def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
     log.info(f"  ▷ {plade}  {'🆕 første gang → SMS til ' + tlf if første_gang else '✔ known → ingen kvittering'}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="da-DK",
-            viewport={"width": 1280, "height": 720},
-        )
-        page = context.new_page()
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-        # Stealth-mode: patcher browseren så Cloudflare ikke ser det er en bot
-        if HAS_STEALTH:
-            stealth_sync(page)
+    # ── Trin 1: Hent siden og udtræk skjulte formfelter ──────
+    try:
+        r = session.get(URL, timeout=15)
+        r.raise_for_status()
+        log.info(f"  GET {r.status_code}")
+    except Exception as e:
+        log.error(f"  ❌ Kunne ikke hente siden: {e}")
+        return False
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # Find form action
+    form = soup.find("form")
+    action = form.get("action", "") if form else ""
+    if not action.startswith("http"):
+        base = "https://vqr.avantpark.dk"
+        action = base + action if action.startswith("/") else URL
+
+    log.info(f"  Form action: {action}")
+
+    # Saml alle skjulte felter (inkl. CSRF tokens)
+    data = {}
+    if form:
+        for inp in form.find_all("input"):
+            name  = inp.get("name", "")
+            value = inp.get("value", "")
+            if name:
+                data[name] = value
+
+    log.info(f"  Skjulte felter fundet: {list(data.keys())}")
+
+    # ── Trin 2: Udfyld formularen ─────────────────────────────
+    # Nummerplade — find det rigtige feltnavn
+    plate_field = next(
+        (k for k in data if any(w in k.lower() for w in ["plate", "nummerplade", "regnr", "licens"])),
+        None
+    )
+    if not plate_field and form:
+        txt = form.find("input", {"type": "text"})
+        plate_field = txt.get("name") if txt else None
+    if plate_field:
+        data[plate_field] = plade
+        log.info(f"  Nummerplade feltnavn: '{plate_field}' = {plade}")
+    else:
+        log.warning("  ⚠️  Kunne ikke finde nummerpladefelt — gætter 'plate'")
+        data["plate"] = plade
+
+    # Kvittering — find radio-feltnavnet
+    receipt_field = next(
+        (k for k in data if any(w in k.lower() for w in ["receipt", "kvittering", "notification", "sms"])),
+        None
+    )
+    if not receipt_field and form:
+        radio = form.find("input", {"type": "radio"})
+        receipt_field = radio.get("name") if radio else None
+
+    if receipt_field:
+        if første_gang:
+            # Find SMS-værdien
+            radios = form.find_all("input", {"type": "radio", "name": receipt_field}) if form else []
+            sms_val = next((r.get("value","") for r in radios if "sms" in r.get("value","").lower() or "sms" in str(r).lower()), "2")
+            data[receipt_field] = sms_val
+            # Telefonnummer
+            tel_inp = form.find("input", {"type": "tel"}) if form else None
+            tel_name = tel_inp.get("name") if tel_inp else "phone"
+            data[tel_name] = tlf
+            log.info(f"  Kvittering: SMS ({sms_val}), tlf: {tlf}")
         else:
-            log.warning("  ⚠️  playwright_stealth ikke tilgængelig")
+            radios = form.find_all("input", {"type": "radio", "name": receipt_field}) if form else []
+            no_val = next((r.get("value","0") for r in radios if r.get("value","") in ["0","none","no"]), "0")
+            data[receipt_field] = no_val
+            log.info(f"  Kvittering: ingen ({no_val})")
+    else:
+        log.warning("  ⚠️  Kunne ikke finde kvitteringsfelt")
 
-        try:
-            page.goto(URL, wait_until="domcontentloaded", timeout=30_000)
-            log.info("  Side indlæst")
+    log.info(f"  POST data: { {k: ('***' if 'token' in k.lower() or 'csrf' in k.lower() else v) for k,v in data.items()} }")
 
-            # ── Trin 1: Vælg kvitteringstype ────────────────────
-            if første_gang:
-                try:
-                    page.get_by_text("SMS-kvittering", exact=True).click(timeout=5_000)
-                except Exception:
-                    page.locator("input[type='radio']:nth-of-type(3)").click(timeout=5_000)
+    # ── Trin 3: Send formularen ───────────────────────────────
+    try:
+        r2 = session.post(action, data=data, timeout=15, allow_redirects=True)
+        log.info(f"  POST {r2.status_code} → {r2.url}")
 
-                tlf_input = page.locator(
-                    "input[type='tel'], input[name*='phone' i], input[name*='mobile' i], "
-                    "input[name*='telefon' i], input[placeholder*='telefon' i], input[placeholder*='mobil' i]"
-                ).first
-                tlf_input.wait_for(state="visible", timeout=8_000)
-                tlf_input.fill(tlf)
-                log.info(f"  SMS-nr udfyldt: {tlf}")
-            else:
-                try:
-                    page.locator("input[type='radio'][value='0'], input[type='radio']:first-of-type").first.click(timeout=5_000)
-                except Exception:
-                    page.get_by_text("Ingen kvittering ønsket", exact=True).click(timeout=5_000)
+        body = BeautifulSoup(r2.text, "html.parser").get_text(separator=" ", strip=True)
+        log.info(f"  Svar: {body[:300]}")
 
-            # ── Trin 2: Udfyld nummerplade ──────────────────────
-            plate_input = page.locator(
-                "input[type='text'], input[name*='plate' i], "
-                "input[name*='nummerplade' i], input[id*='plate' i]"
-            ).first
-            plate_input.wait_for(state="visible", timeout=10_000)
-            plate_input.click()
-            plate_input.fill("")
-            plate_input.type(plade)
-            log.info(f"  Nummerplade udfyldt: {plade}")
+        if any(w in body.lower() for w in ["bekræft", "registrer", "confirm", "success", "tak", "gennemført", "registered"]):
+            log.info(f"  ✅ {plade} — GENNEMFØRT")
+            return True
+        if "EnterPlate" not in r2.url:
+            log.info(f"  ✅ {plade} — GENNEMFØRT (URL skiftede)")
+            return True
 
-            # ── Trin 3: Vent på Turnstile ────────────────────────
-            log.info("  Venter på Cloudflare Turnstile…")
-            for i in range(30):
-                token = page.evaluate("""() => {
-                    const el = document.querySelector('[name="cf-turnstile-response"]');
-                    return el ? el.value : '';
-                }""")
-                if token and len(token) > 10:
-                    log.info(f"  ✓ Turnstile gennemført ({i+1} sek.)")
-                    break
-                time.sleep(1)
-            else:
-                log.warning("  ⚠️  Turnstile ikke bekræftet — forsøger alligevel")
+        log.warning(f"  ⚠️  {plade} — Ingen bekræftelse")
+        return False
 
-            # ── Trin 4: Indsend ──────────────────────────────────
-            submit = page.locator("button[type='submit'], input[type='submit']").first
-            submit.wait_for(state="visible", timeout=10_000)
-            submit.click()
-            log.info("  Klikket indsend — venter på svar…")
-
-            try:
-                page.wait_for_url(
-                    lambda url: "EnterPlate" not in url,
-                    timeout=15_000
-                )
-            except Exception:
-                time.sleep(5)
-
-            current_url = page.url
-            body_text   = page.inner_text("body")
-            log.info(f"  URL: {current_url}")
-            log.info(f"  Side-tekst: {body_text[:300]}")
-
-            if "EnterPlate" not in current_url or any(
-                w in body_text.lower() for w in ["bekræft", "registrer", "confirm", "success", "tak", "gennemført", "registered"]
-            ):
-                log.info(f"  ✅ {plade} — GENNEMFØRT")
-                return True
-
-            log.warning(f"  ⚠️  {plade} — Ingen bekræftelse modtaget")
-            return False
-
-        except Exception as e:
-            log.error(f"  ❌ {plade} — Fejl: {e}")
-            return False
-        finally:
-            browser.close()
+    except Exception as e:
+        log.error(f"  ❌ POST fejlede: {e}")
+        return False
 
 
 def main():
