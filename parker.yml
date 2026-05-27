@@ -24,15 +24,14 @@ jobs:
 
       - name: Installer afhængigheder
         run: |
-          pip install playwright
+          pip install playwright playwright_stealth
           playwright install chromium
           playwright install-deps chromium
-          sudo apt-get install -y xvfb
 
-      - name: Kør check-in med virtuel skærm
+      - name: Kør check-in
         env:
           NUMMERPLADER: ${{ secrets.NUMMERPLADER }}
-        run: xvfb-run --auto-servernum python parker_auto.py
+        run: python parker_auto.py
 
       - name: Gem verified_plates.json
         run: |
@@ -41,4 +40,3 @@ jobs:
           git add verified_plates.json
           git diff --cached --quiet || git commit -m "✅ Opdater verificerede nummerplader"
           git push
-
