@@ -12,7 +12,11 @@ import time
 import logging
 from pathlib import Path
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+try:
+    from playwright_stealth import stealth_sync
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
 
 URL           = "https://vqr.avantpark.dk/QRCode/EnterPlate?Hash=jZqtyJgHJ"
 VERIFIED_FILE = Path("verified_plates.json")
@@ -71,7 +75,10 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
         page = context.new_page()
 
         # Stealth-mode: patcher browseren så Cloudflare ikke ser det er en bot
-        stealth_sync(page)
+        if HAS_STEALTH:
+            stealth_sync(page)
+        else:
+            log.warning("  ⚠️  playwright_stealth ikke tilgængelig")
 
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=30_000)
