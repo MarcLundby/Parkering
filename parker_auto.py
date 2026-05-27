@@ -12,6 +12,7 @@ import time
 import logging
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 URL           = "https://vqr.avantpark.dk/QRCode/EnterPlate?Hash=jZqtyJgHJ"
 VERIFIED_FILE = Path("verified_plates.json")
@@ -50,45 +51,31 @@ def hent_plader() -> list[dict]:
     return plader
 
 
-def vent_på_turnstile(page, timeout=30) -> bool:
-    """Venter aktivt på at Cloudflare Turnstile gennemfører."""
-    log.info("  Venter på Cloudflare Turnstile…")
-    for i in range(timeout):
-        try:
-            token = page.evaluate("""() => {
-                const el = document.querySelector('[name="cf-turnstile-response"]');
-                return el ? el.value : '';
-            }""")
-            if token and len(token) > 10:
-                log.info(f"  ✓ Turnstile gennemført ({i+1} sek.)")
-                return True
-        except Exception:
-            pass
-        time.sleep(1)
-    log.warning(f"  ⚠️  Turnstile ikke bekræftet efter {timeout} sek. — forsøger alligevel")
-    return False
-
-
 def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
     log.info(f"  ▷ {plade}  {'🆕 første gang → SMS til ' + tlf if første_gang else '✔ known → ingen kvittering'}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
             ],
         )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             locale="da-DK",
+            viewport={"width": 1280, "height": 720},
         )
         page = context.new_page()
 
+        # Stealth-mode: patcher browseren så Cloudflare ikke ser det er en bot
+        stealth_sync(page)
+
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=30_000)
+            log.info("  Side indlæst")
 
             # ── Trin 1: Vælg kvitteringstype ────────────────────
             if første_gang:
@@ -121,8 +108,19 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
             plate_input.type(plade)
             log.info(f"  Nummerplade udfyldt: {plade}")
 
-            # ── Trin 3: Vent aktivt på Turnstile ────────────────
-            vent_på_turnstile(page, timeout=30)
+            # ── Trin 3: Vent på Turnstile ────────────────────────
+            log.info("  Venter på Cloudflare Turnstile…")
+            for i in range(30):
+                token = page.evaluate("""() => {
+                    const el = document.querySelector('[name="cf-turnstile-response"]');
+                    return el ? el.value : '';
+                }""")
+                if token and len(token) > 10:
+                    log.info(f"  ✓ Turnstile gennemført ({i+1} sek.)")
+                    break
+                time.sleep(1)
+            else:
+                log.warning("  ⚠️  Turnstile ikke bekræftet — forsøger alligevel")
 
             # ── Trin 4: Indsend ──────────────────────────────────
             submit = page.locator("button[type='submit'], input[type='submit']").first
@@ -130,10 +128,9 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
             submit.click()
             log.info("  Klikket indsend — venter på svar…")
 
-            # Vent på siden skifter
             try:
                 page.wait_for_url(
-                    lambda url: url != URL and "EnterPlate" not in url,
+                    lambda url: "EnterPlate" not in url,
                     timeout=15_000
                 )
             except Exception:
@@ -144,7 +141,7 @@ def check_in(plade: str, tlf: str, første_gang: bool) -> bool:
             log.info(f"  URL: {current_url}")
             log.info(f"  Side-tekst: {body_text[:300]}")
 
-            if current_url != URL or "confirm" in current_url.lower() or any(
+            if "EnterPlate" not in current_url or any(
                 w in body_text.lower() for w in ["bekræft", "registrer", "confirm", "success", "tak", "gennemført", "registered"]
             ):
                 log.info(f"  ✅ {plade} — GENNEMFØRT")
