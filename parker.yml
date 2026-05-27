@@ -32,11 +32,7 @@ jobs:
       - name: Kør check-in med virtuel skærm
         env:
           NUMMERPLADER: ${{ secrets.NUMMERPLADER }}
-          DISPLAY: :99
-        run: |
-          Xvfb :99 -screen 0 1280x720x24 -ac &
-          sleep 2
-          python parker_auto.py
+        run: xvfb-run --auto-servernum python parker_auto.py
 
       - name: Gem verified_plates.json
         run: |
@@ -45,3 +41,4 @@ jobs:
           git add verified_plates.json
           git diff --cached --quiet || git commit -m "✅ Opdater verificerede nummerplader"
           git push
+
